@@ -118,6 +118,19 @@ export interface PersistOptions<
    * @default false
    */
   skipHydration?: boolean
+  /**
+   * Time window (in milliseconds) used to coalesce writes to the storage.
+   *
+   * The first state update opens a window; further updates within the window
+   * are buffered, and a single write of the latest state happens when the
+   * window ends. This avoids serializing and writing on every state update
+   * (e.g. on every keystroke), which can block the main thread.
+   *
+   * Set to `0` to write immediately on every state update (previous behavior).
+   *
+   * @default 100
+   */
+  writeDelay?: number
 }
 
 type PersistListener<S> = (state: S) => void
@@ -190,6 +203,7 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     storage: createJSONStorage<S, void>(() => window.localStorage),
     partialize: (state: S) => state,
     version: 0,
+    writeDelay: 100,
     merge: (persistedState: unknown, currentState: S) => ({
       ...currentState,
       ...(persistedState as object),
@@ -218,7 +232,14 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     )
   }
 
-  const setItem = () => {
+  // Writes are coalesced: the first state update opens a fixed time window
+  // ('writeDelay'), and a single write of the latest state happens when the
+  // window ends. The snapshot is taken at flush time, so the window always
+  // persists the most recent state. Set 'writeDelay' to 0 for an immediate
+  // write on every update.
+  let pendingWriteTimeout: ReturnType<typeof setTimeout> | undefined
+
+  const writeNow = () => {
     const state = options.partialize({ ...get() })
     return (storage as PersistStorage<S, unknown>).setItem(options.name, {
       state,
@@ -226,17 +247,46 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     })
   }
 
+  const cancelPendingWrite = () => {
+    if (pendingWriteTimeout !== undefined) {
+      clearTimeout(pendingWriteTimeout)
+      pendingWriteTimeout = undefined
+    }
+  }
+
+  const flushPendingWrite = () => {
+    if (pendingWriteTimeout === undefined) {
+      return
+    }
+    cancelPendingWrite()
+    writeNow()
+  }
+
+  const scheduleWrite = (): unknown => {
+    const delay = options.writeDelay ?? 100
+    if (delay <= 0) {
+      return writeNow()
+    }
+    if (pendingWriteTimeout !== undefined) {
+      return
+    }
+    pendingWriteTimeout = setTimeout(() => {
+      pendingWriteTimeout = undefined
+      writeNow()
+    }, delay)
+  }
+
   const savedSetState = api.setState
 
   api.setState = (state, replace) => {
     savedSetState(state, replace as any)
-    return setItem()
+    return scheduleWrite()
   }
 
   const configResult = config(
     (...args) => {
       set(...(args as Parameters<typeof set>))
-      return setItem()
+      return scheduleWrite()
     },
     get,
     api,
@@ -306,7 +356,7 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
 
         set(stateFromStorage as S, true)
         if (migrated) {
-          return setItem()
+          return writeNow()
         }
       })
       .then(() => {
@@ -347,6 +397,7 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
     },
     clearStorage: () => {
       ++hydrationVersion
+      cancelPendingWrite()
       storage?.removeItem(options.name)
     },
     getOptions: () => options,
@@ -366,6 +417,62 @@ const persistImpl: PersistImpl = (config, baseOptions) => (set, get, api) => {
         finishHydrationListeners.delete(cb)
       }
     },
+  }
+
+  // Cross-tab synchronization: when another tab writes the same key, apply
+  // the incoming state locally. Applying a remote update never schedules a
+  // write, so two tabs can't ping-pong. If a local write is still buffered
+  // when a remote update arrives, the local update wins: the remote state is
+  // skipped and our pending flush shares the local state, which the other
+  // tab then applies. This keeps both tabs converging instead of
+  // overwriting each other.
+  const handleStorageEvent = (event: StorageEvent) => {
+    if (event.key !== options.name || event.newValue === null) {
+      return
+    }
+    if (pendingWriteTimeout !== undefined || !storage) {
+      return
+    }
+    // Re-read through the configured storage instead of parsing
+    // 'event.newValue', so custom (and async) storages keep working.
+    toThenable(storage.getItem.bind(storage))(options.name).then(
+      (deserializedStorageValue) => {
+        if (!deserializedStorageValue) {
+          return
+        }
+        if (
+          typeof deserializedStorageValue.version === 'number' &&
+          deserializedStorageValue.version !== options.version
+        ) {
+          return
+        }
+        // A local update may have been scheduled while reading (async storage)
+        if (pendingWriteTimeout !== undefined) {
+          return
+        }
+        set(options.merge(deserializedStorageValue.state, get()) as S, true)
+      },
+    )
+  }
+
+  const flushPendingWriteOnHide = () => {
+    if (
+      typeof document === 'undefined' ||
+      document.visibilityState === 'hidden'
+    ) {
+      flushPendingWrite()
+    }
+  }
+
+  // Flush the buffered write when the page is hidden or closed instead of
+  // waiting for the window to end. Note: with an asynchronous storage the
+  // final write is not guaranteed to complete before the page unloads.
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('storage', handleStorageEvent)
+    window.addEventListener('pagehide', flushPendingWrite)
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      document.addEventListener('visibilitychange', flushPendingWriteOnHide)
+    }
   }
 
   if (!options.skipHydration) {
